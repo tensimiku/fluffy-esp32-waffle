@@ -1,0 +1,12 @@
+[submodule "ntp_client/components/u8g2-hal-esp-idf"]
+	path = ntp_client/components/u8g2-hal-esp-idf
+	url = git@github.com:tensimiku/u8g2-hal-esp-idf.git
+[submodule "ntp_client/components/u8g2"]
+	path = ntp_client/components/u8g2
+	url = https://github.com/olikraus/u8g2.git
+[submodule "softAP/components/u8g2"]
+	path = softAP/components/u8g2
+	url = https://github.com/olikraus/u8g2.git
+[submodule "softAP/components/u8g2-hal-esp-idf"]
+	path = softAP/components/u8g2-hal-esp-idf
+	url = git@github.com:tensimiku/u8g2-hal-esp-idf.git
