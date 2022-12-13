@@ -24,10 +24,14 @@
 #include "lwip/sockets.h"
 #include <lwip/netdb.h>
 
+// timer
+#include "driver/gptimer.h"
+
 /* The examples use WiFi configuration that you can set via project configuration menu
    If you'd rather not, just change the below entries to strings with
    the config you want - ie #define EXAMPLE_WIFI_SSID "mywifissid"
 */
+#define CONFIG_ESP32_IPV4
 #define EXAMPLE_ESP_WIFI_SSID      CONFIG_ESP_WIFI_SSID
 #define EXAMPLE_ESP_WIFI_PASS      CONFIG_ESP_WIFI_PASSWORD
 #define EXAMPLE_ESP_MAXIMUM_RETRY  CONFIG_ESP_MAXIMUM_RETRY
@@ -68,13 +72,21 @@ static const char *TAG = "wifi station";
 static int s_retry_num = 0;
 
 
-// UDP port number
+// UDP IP, port number
+#define SYNC_IP_ADDR "192.168.4.1"
+#define SYNC_PORT 33333
 #define PORT 54321
+#define INIT_RTT 99999999
 // display
 static u8g2_t u8g2;  // a structure which will contain all the data for one display
 static char current_ip_addr[17];
 static char current_mac_addr[19];
 static char received_packet_msg[64];
+
+// timer
+static gptimer_handle_t gptimer = NULL;
+static QueueHandle_t timer_queue = NULL;
+
 
 
 
@@ -127,6 +139,77 @@ void init_SSD1306(){
     u8g2_DrawStr(&u8g2, 0, 40, "where i am going");
     u8g2_SendBuffer(&u8g2);
     // u8g2_DrawBox(&u8g2, 10, 20, 20, 30);
+}
+
+void configure_led(void)
+{
+    gpio_reset_pin(LED_GPIO);
+    /* Set the GPIO as a push/pull output */
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+}
+
+void create_timer(){
+    ESP_LOGI(TAG, "Create timer handle");
+    gptimer_config_t timer_config = {
+        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
+        .direction = GPTIMER_COUNT_UP,
+        .resolution_hz = 1000000, // 1MHz, 1 tick=1us
+    };
+    ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &gptimer));
+    ESP_LOGI(TAG, "Enable timer");
+    ESP_ERROR_CHECK(gptimer_enable(gptimer));
+    ESP_ERROR_CHECK(gptimer_start(gptimer));
+    timer_queue = xQueueCreate(10, sizeof(bool));
+}
+
+static bool IRAM_ATTR timer_on_alarm_cb(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data)
+{
+    BaseType_t high_task_awoken = pdFALSE;
+    QueueHandle_t queue = (QueueHandle_t)user_data;
+    bool evt = (edata->count_value / 1000000) % 2 == 0;
+    xQueueSendFromISR(queue, &evt, &high_task_awoken);
+    // Retrieve count value and send to queue
+    // example_queue_element_t ele = {
+    //     .event_count = edata->count_value
+    // };
+    // xQueueSendFromISR(queue, &ele, &high_task_awoken);
+    // return whether we need to yield at the end of ISR
+    gptimer_alarm_config_t alarm_config = {
+        .alarm_count = edata->alarm_value + 1000000, // alarm in next 1s
+    };
+    gptimer_set_alarm_action(timer, &alarm_config);
+    return (high_task_awoken == pdTRUE);
+}
+
+void set_led_alarm(){
+    ESP_ERROR_CHECK(gptimer_disable(gptimer));
+     gptimer_event_callbacks_t cbs = {
+        .on_alarm = timer_on_alarm_cb,
+    };
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(gptimer, &cbs, timer_queue));
+    gptimer_alarm_config_t alarm_config = {
+        .alarm_count = 1000000, // period = 1s
+    };
+    ESP_ERROR_CHECK(gptimer_set_alarm_action(gptimer, &alarm_config));
+    ESP_ERROR_CHECK(gptimer_enable(gptimer));
+}
+
+
+static void alarm_led_task(void* arg)
+{
+    QueueHandle_t queue = (QueueHandle_t)arg;
+    bool evt;
+    for(;;) {
+        if(xQueueReceive(queue, &evt, portMAX_DELAY)) {
+            if(evt){
+                gpio_set_level(LED_GPIO, 1);
+            }
+            else{
+                gpio_set_level(LED_GPIO, 0);
+            }
+        }
+    }
+    vTaskDelete(NULL);
 }
 
 void get_esp32_mac_addr(){
@@ -214,6 +297,7 @@ void wifi_init_sta(void)
 void display_task(void* args) {
     char buf[32];
     struct timeval current_time;
+    uint64_t timer_count;
     while(1){
         gettimeofday(&current_time, NULL);
         u8g2_ClearBuffer(&u8g2);
@@ -223,11 +307,132 @@ void display_task(void* args) {
         u8g2_DrawStr(&u8g2, 0, 30, buf);
         u8g2_DrawStr(&u8g2, 0, 40, current_ip_addr);
         u8g2_DrawStr(&u8g2, 0, 50, received_packet_msg);
+        ESP_ERROR_CHECK(gptimer_get_raw_count(gptimer, &timer_count));
+        sprintf(buf, "timer: %lld", timer_count);
+        u8g2_DrawStr(&u8g2, 0, 60, buf);
         u8g2_SendBuffer(&u8g2);
         vTaskDelay(1000/portTICK_PERIOD_MS); // 1 sec
     }
     vTaskDelete(NULL);
 }
+
+void sync_timer(int sync_count)
+{
+    char rx_buffer[128];
+    char payload[16];
+    char host_ip[] = SYNC_IP_ADDR;
+    int addr_family = 0;
+    int ip_protocol = 0;
+    int retry = 4;
+    uint64_t timer_count;
+    uint64_t received_count;
+
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    ESP_LOGI(TAG, "Start sync");
+
+    while (retry-- > 0) {
+#if defined(CONFIG_ESP32_IPV4)
+        struct sockaddr_in dest_addr;
+        dest_addr.sin_addr.s_addr = inet_addr(SYNC_IP_ADDR);
+        dest_addr.sin_family = AF_INET;
+        dest_addr.sin_port = htons(SYNC_PORT);
+        addr_family = AF_INET;
+        ip_protocol = IPPROTO_IP;
+#elif defined(CONFIG_ESP32_IPV6)
+        struct sockaddr_in6 dest_addr = { 0 };
+        inet6_aton(SYNC_IP_ADDR, &dest_addr.sin6_addr);
+        dest_addr.sin6_family = AF_INET6;
+        dest_addr.sin6_port = htons(SYNC_PORT);
+        dest_addr.sin6_scope_id = esp_netif_get_netif_impl_index(EXAMPLE_INTERFACE);
+        addr_family = AF_INET6;
+        ip_protocol = IPPROTO_IPV6;
+#elif defined(CONFIG_EXAMPLE_SOCKET_IP_INPUT_STDIN)
+        struct sockaddr_storage dest_addr = { 0 };
+        ESP_ERROR_CHECK(get_addr_from_stdin(SYNC_PORT, SOCK_DGRAM, &ip_protocol, &addr_family, &dest_addr));
+#endif
+        int sock = socket(addr_family, SOCK_DGRAM, ip_protocol);
+        if (sock < 0) {
+            ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+            break;
+        }
+        // Set timeout
+        struct timeval timeout;
+        timeout.tv_sec = 10;
+        timeout.tv_usec = 0;
+        setsockopt (sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+        ESP_LOGI(TAG, "Socket created, sending to %s:%d", SYNC_IP_ADDR, SYNC_PORT);
+        payload[0] = 'E';
+        payload[1] = 'A';
+        payload[2] = 0;
+        int minrtt = INIT_RTT;
+
+        // ESP_LOGI(TAG, "Message sent");
+        while (sync_count-- > 0) {
+            ESP_ERROR_CHECK(gptimer_get_raw_count(gptimer, &timer_count));
+            *(uint64_t*)(payload+1) = timer_count;
+            // int err = sendto(sock, payload, sizeof(timer_count)+2, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+            int err = sendto(sock, payload, strlen(payload), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+            if (err < 0) {
+                ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
+                break;
+            }
+            // sprintf(payload, "sv time: %lld. %ld", current_time.tv_sec, current_time.tv_usec);
+            struct sockaddr_storage source_addr; // Large enough for both IPv4 or IPv6
+            socklen_t socklen = sizeof(source_addr);
+            int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0, (struct sockaddr *)&source_addr, &socklen);
+            // Error occurred during receiving
+            if (len < 0) {
+                ESP_LOGE(TAG, "recvfrom failed: errno %d", errno);
+                break;
+            }
+            // Data received
+            else {
+                ESP_ERROR_CHECK(gptimer_get_raw_count(gptimer, &received_count));
+                int estirtt = received_count - timer_count;
+                if (minrtt > estirtt){
+                    minrtt = estirtt;
+                }
+                ESP_LOGI(TAG, "Estimated RTT: %llu", received_count - timer_count);
+                // rx_buffer[len] = 0; // Null-terminate whatever we received and treat like a string
+                ESP_LOGI(TAG, "Received %d bytes from %s:", len, host_ip);
+                // ESP_LOGI(TAG, "%s", rx_buffer);
+                // if (strncmp(rx_buffer, "OK: ", 4) == 0) {
+                //     ESP_LOGI(TAG, "Received expected message, reconnecting");
+                //     break;
+                // }
+            }
+        }
+        if (minrtt != INIT_RTT){
+            ESP_ERROR_CHECK(gptimer_stop(gptimer));
+            ESP_ERROR_CHECK(gptimer_disable(gptimer));
+            payload[0] = 'R';
+            payload[1] = 0;
+            int err = sendto(sock, payload, strlen(payload), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+            if (err < 0) {
+                ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
+                break;
+            }
+            // sprintf(payload, "sv time: %lld. %ld", current_time.tv_sec, current_time.tv_usec);
+            struct sockaddr_storage source_addr; // Large enough for both IPv4 or IPv6
+            socklen_t socklen = sizeof(source_addr);
+            int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0, (struct sockaddr *)&source_addr, &socklen);
+            if (len==8){
+                received_count = ((uint64_t*)rx_buffer)[0];
+                ESP_ERROR_CHECK(gptimer_set_raw_count(gptimer, received_count+(minrtt/2)));
+                ESP_ERROR_CHECK(gptimer_enable(gptimer));
+                ESP_ERROR_CHECK(gptimer_start(gptimer));
+            }
+            break;
+        }
+        if (sock != -1) {
+            ESP_LOGE(TAG, "Shutting down socket and restarting...");
+            shutdown(sock, 0);
+            close(sock);
+        }
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+    }
+}
+    // vTaskDelete(NULL);
 
 
 static void udp_server_task(void *pvParameters)
@@ -237,9 +442,8 @@ static void udp_server_task(void *pvParameters)
     int addr_family = (int)pvParameters;
     int ip_protocol = 0;
     struct sockaddr_in6 dest_addr;
-
+    uint64_t timer_count;
     while (1) {
-
         if (addr_family == AF_INET) {
             struct sockaddr_in *dest_addr_ip4 = (struct sockaddr_in *)&dest_addr;
             dest_addr_ip4->sin_addr.s_addr = htonl(INADDR_ANY);
@@ -260,12 +464,12 @@ static void udp_server_task(void *pvParameters)
         }
         ESP_LOGI(TAG, "Socket created");
 
-#if defined(CONFIG_LWIP_NETBUF_RECVINFO) && !defined(CONFIG_EXAMPLE_IPV6)
+#if defined(CONFIG_LWIP_NETBUF_RECVINFO) && !defined(CONFIG_ESP32_IPV6)
         int enable = 1;
         lwip_setsockopt(sock, IPPROTO_IP, IP_PKTINFO, &enable, sizeof(enable));
 #endif
 
-#if defined(CONFIG_EXAMPLE_IPV4) && defined(CONFIG_EXAMPLE_IPV6)
+#if defined(CONFIG_ESP32_IPV4) && defined(CONFIG_ESP32_IPV6)
         if (addr_family == AF_INET6) {
             // Note that by default IPV6 binds to both protocols, it is must be disabled
             // if both protocols used at the same time (used in CI)
@@ -289,7 +493,7 @@ static void udp_server_task(void *pvParameters)
         struct sockaddr_storage source_addr; // Large enough for both IPv4 or IPv6
         socklen_t socklen = sizeof(source_addr);
 
-#if defined(CONFIG_LWIP_NETBUF_RECVINFO) && !defined(CONFIG_EXAMPLE_IPV6)
+#if defined(CONFIG_LWIP_NETBUF_RECVINFO) && !defined(CONFIG_ESP32_IPV6)
         struct iovec iov;
         struct msghdr msg;
         struct cmsghdr *cmsgtmp;
@@ -308,7 +512,7 @@ static void udp_server_task(void *pvParameters)
 
         while (1) {
             ESP_LOGI(TAG, "Waiting for data");
-#if defined(CONFIG_LWIP_NETBUF_RECVINFO) && !defined(CONFIG_EXAMPLE_IPV6)
+#if defined(CONFIG_LWIP_NETBUF_RECVINFO) && !defined(CONFIG_ESP32_IPV6)
             int len = recvmsg(sock, &msg, 0);
 #else
             int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0, (struct sockaddr *)&source_addr, &socklen);
@@ -323,7 +527,7 @@ static void udp_server_task(void *pvParameters)
                 // Get the sender's ip address as string
                 if (source_addr.ss_family == PF_INET) {
                     inet_ntoa_r(((struct sockaddr_in *)&source_addr)->sin_addr, addr_str, sizeof(addr_str) - 1);
-#if defined(CONFIG_LWIP_NETBUF_RECVINFO) && !defined(CONFIG_EXAMPLE_IPV6)
+#if defined(CONFIG_LWIP_NETBUF_RECVINFO) && !defined(CONFIG_ESP32_IPV6)
                     for ( cmsgtmp = CMSG_FIRSTHDR(&msg); cmsgtmp != NULL; cmsgtmp = CMSG_NXTHDR(&msg, cmsgtmp) ) {
                         if ( cmsgtmp->cmsg_level == IPPROTO_IP && cmsgtmp->cmsg_type == IP_PKTINFO ) {
                             struct in_pktinfo *pktinfo;
@@ -336,12 +540,18 @@ static void udp_server_task(void *pvParameters)
                     inet6_ntoa_r(((struct sockaddr_in6 *)&source_addr)->sin6_addr, addr_str, sizeof(addr_str) - 1);
                 }
 
-                rx_buffer[len] = 0; // Null-terminate whatever we received and treat like a string...
+                // rx_buffer[len] = 0; // Null-terminate whatever we received and treat like a string...
                 ESP_LOGI(TAG, "Received %d bytes from %s:", len, addr_str);
-                sprintf(received_packet_msg, "%.62s", rx_buffer);
-                ESP_LOGI(TAG, "%s", rx_buffer);
-
-                int err = sendto(sock, rx_buffer, len, 0, (struct sockaddr *)&source_addr, sizeof(source_addr));
+                // sprintf(received_packet_msg, "%.62s", rx_buffer);
+                // ESP_LOGI(TAG, "%s", rx_buffer);
+                int err;
+                err = sendto(sock, rx_buffer, len, 0, (struct sockaddr *)&source_addr, sizeof(source_addr));
+                // if (rx_buffer[0] == 'E'){ // ECHO request
+                //     err = sendto(sock, rx_buffer+1, len-1, 0, (struct sockaddr *)&source_addr, sizeof(source_addr));
+                // } else{
+                //     ESP_ERROR_CHECK(gptimer_get_raw_count(gptimer, &timer_count));
+                //     err = sendto(sock, (void*)&timer_count, sizeof(timer_count), 0, (struct sockaddr *)&source_addr, sizeof(source_addr));
+                // }
                 if (err < 0) {
                     ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
                     break;
@@ -362,10 +572,12 @@ void app_main(void)
 {
     // initialize oled
     init_SSD1306();
+    configure_led();
+    // timer init
+    create_timer();
+
     get_esp32_mac_addr();
-    // xTaskCreatePinnedToCore(display_task, "disp", NULL, 0, NULL, 0 ); // pin to core 0(net)? or 1?
-    xTaskCreate(display_task, "disp", 2048, NULL, 1, NULL);
-    //Initialize NVS
+
 
     //Initialize NVS
     esp_err_t ret = nvs_flash_init();
@@ -378,6 +590,14 @@ void app_main(void)
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     wifi_init_sta();
 
+    sync_timer(6);
+
+    set_led_alarm();
+    xTaskCreate(alarm_led_task, "alarm_led", 2048, (void*)timer_queue, 2, NULL);
+
+    // xTaskCreatePinnedToCore(display_task, "disp", NULL, 0, NULL, 0 ); // pin to core 0(net)? or 1?
+    xTaskCreate(display_task, "disp", 2048, NULL, 1, NULL);
+    //Initialize NVS
     // after initialize wifi run udp_server
     xTaskCreate(udp_server_task, "udp_server", 4096, (void*)AF_INET, 5, NULL);
 }
